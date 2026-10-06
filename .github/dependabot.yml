@@ -1,0 +1,8 @@
+# The actions start-runner.yml uses are pinned to commit SHAs, because they run
+# holding the AWS role; this is what keeps those pins current.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

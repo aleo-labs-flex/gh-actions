@@ -1,0 +1,140 @@
+# Numbers worth keeping from a job that ran on the GPU runner.
+#
+# Call with `if: always()` so a failed build still reports its disk and memory
+# state -- that is exactly when the numbers matter. See aws-dev-infra#3.
+name: GPU runner report
+description: Append disk and GPU memory state to the job summary.
+
+inputs:
+  disk-guard:
+    description: Path to runner-disk-guard on the box.
+    required: false
+    default: /usr/local/bin/runner-disk-guard
+  deployment-gpu-mib:
+    description: >-
+      Total GPU memory of the card this code deploys to, AS NVIDIA-SMI REPORTS
+      IT, since that is what the sampler measures. A peak at or above this would
+      not fit on the deployment card whatever the runner happens to be.
+
+      NOT the number AWS reports. describe-instance-types says 45776 MiB for a
+      g6e.xlarge while nvidia-smi on that same box says 46068, and the offsets
+      are not proportional -- so an AWS-derived constant compared against a
+      sampled nvidia-smi value compares two different measurements.
+
+      The default is nvidia-smi's figure on a real L4 (g6.2xlarge, dps M-1056;
+      aws-dev-infra#6). The runner IS an L4 (`g6.4xlarge`), and start-runner.yml re-tries
+      that shape on every start, so a box sitting on g6e is a transient capacity
+      fallback rather than where it lives.
+    required: false
+    default: '23034'
+
+runs:
+  using: composite
+  steps:
+    - name: Disk and GPU report
+      shell: bash
+      env:
+        DISK_GUARD: ${{ inputs.disk-guard }}
+        DEPLOYMENT_GPU_MIB: ${{ inputs.deployment-gpu-mib }}
+      run: |
+        set -uo pipefail
+
+        # Read everything BEFORE the summary block. The ::warning:: below has to
+        # reach stdout to become a GitHub annotation, and an earlier version
+        # emitted it from inside `{ ... } >> "$GITHUB_STEP_SUMMARY"` -- so it was
+        # written into the summary file as literal text and no annotation was
+        # ever produced. Same shape as measuring memory after the tests: it looks
+        # like it works and never reaches where it matters.
+        # `|| true` because this runs under `set -e` with pipefail: without it a
+        # driver that failed to load takes the whole step down with a bare
+        # "exit code 9" and the 2>/dev/null throws away the one line that says
+        # why. The empty-and-non-numeric guards below already handle a missing
+        # total, so failing soft here loses nothing and keeps the report -- the
+        # disk section included -- reaching the summary at all (#10).
+        total=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1) || true
+        # RUNNER_TEMP, matching gpu-runner-preflight. On /tmp this file outlived
+        # its job, so a later job running report without preflight read the
+        # previous job's peak and printed it as its own -- with the NOT MEASURED
+        # guard unable to fire, the file being present and numeric.
+        peak=$(cat "${RUNNER_TEMP}/gpu-peak-mib" 2>/dev/null || echo "")
+
+        {
+          echo '### Runner disk'
+          echo '```'
+          # The target-directory count matters: the disk cap is one budget across
+          # every target/ together, so a new nested cargo root enlarges what has
+          # to fit under it. This is where that becomes visible before the disk
+          # does.
+          "${DISK_GUARD}" report 2>&1 || echo "(disk guard unavailable)"
+          echo '```'
+          echo '### GPU memory'
+          echo '```'
+          # PEAK, sampled while the tests ran -- not a reading taken now, which
+          # would report memory with the test process already exited.
+          case "${peak}" in
+            ""|*[!0-9]*)
+              echo "peak: NOT MEASURED -- the sampler did not run or wrote nothing."
+              echo "Add the gpu-runner-preflight action before the test steps." ;;
+            *)
+              printf 'peak used : %s MiB\n' "${peak}"
+              printf 'total     : %s MiB\n' "${total:-unknown}"
+              case "${total}" in
+                ""|*[!0-9]*) ;;
+                *) printf 'headroom  : %s MiB (%s%% of the card)\n' \
+                     "$(( total - peak ))" "$(( peak * 100 / total ))" ;;
+              esac ;;
+          esac
+          echo '```'
+        } >> "${GITHUB_STEP_SUMMARY}"
+
+        # Also to STDOUT, not only into the step summary. A summary is readable
+        # in the web UI and nowhere else -- the REST API does not expose it -- so
+        # a peak that exists only there cannot be read back by anything
+        # automated, which is most of the value of measuring it. Verified the
+        # hard way: after a green run the only way to learn whether the peak had
+        # exceeded the threshold was that no annotation had fired.
+        case "${peak}" in
+          ""|*[!0-9]*) echo "gpu-peak-mib=NOT_MEASURED" ;;
+          *) echo "gpu-peak-mib=${peak}"
+             case "${total}" in
+               ""|*[!0-9]*) ;;
+               *) echo "gpu-total-mib=${total}" ;;
+             esac ;;
+        esac
+
+        # Outside the summary block, so this reaches stdout and GitHub renders it
+        # as an annotation. The question the runner exists to answer: would this
+        # peak fit the card we ship on, whatever this box happens to be?
+        case "${peak}:${DEPLOYMENT_GPU_MIB}" in
+          *[!0-9:]*|:*|*:) ;;
+          *) if [ "${peak}" -ge "${DEPLOYMENT_GPU_MIB}" ]; then
+               echo "::warning::peak GPU use ${peak} MiB would not fit the deployment card's ${DEPLOYMENT_GPU_MIB} MiB"
+             fi ;;
+        esac
+
+        # And the converse question: does the peak fit THIS box?
+        # start-runner.yml retypes a box down its capacity ladder when its
+        # configured shape is short, so the shape running a job can be smaller
+        # than any config names and "fits the deployment card" need not imply
+        # "fit here". A job can pass the check above and still be one growth
+        # spurt from an OOM that only ever reproduces on the smaller shape. Warn
+        # near the ceiling rather than at it: the useful moment is before the
+        # failure, not during it.
+        case "${peak}:${total}" in
+          *[!0-9:]*|:*|*:) ;;
+          *) if [ "$(( peak * 100 / total ))" -ge 80 ]; then
+               echo "::warning::peak GPU use ${peak} MiB is $(( peak * 100 / total ))% of THIS box's ${total} MiB." \
+                    "It fits, but with little room -- a slightly larger workload would fail here" \
+                    "while still passing on a full-size card"
+             fi ;;
+        esac
+
+        # Leaving the sampler running would have it survive into the next job on
+        # this persistent runner, and the peak would then span two unrelated ones.
+        if [ -f "${RUNNER_TEMP}/gpu-sampler.pid" ]; then
+          kill "$(cat "${RUNNER_TEMP}/gpu-sampler.pid")" 2>/dev/null || true
+        fi
+        # RUNNER_TEMP is emptied by GitHub at job end so these go with it; the
+        # explicit removal only stops a later step in the SAME job reading a peak
+        # whose sampler has already been stopped.
+        rm -f "${RUNNER_TEMP}/gpu-sampler.pid" "${RUNNER_TEMP}/gpu-peak-mib"

@@ -1,0 +1,699 @@
+# Starts as many shared self-hosted runner boxes as the queue needs, for any
+# repository that needs them.
+#
+# Named start-cuda-runner.yml until there was a CPU box too. The tagged
+# instances and the capacity ladder are the same mechanism whichever box it is;
+# only the inputs differ.
+#
+# Extracted from duplicated copies in aleo-labs-flex/snarkVM-cuda and aleo-labs-flex/dps,
+# where this job was 128 identical lines in each. It had been rewritten three
+# times in a day -- for GitHub's immutable OIDC subject claims, for the capacity
+# retry, and to fix a fallback whose target had silently become its own source --
+# and every one of those was applied twice by hand. See aws-dev-infra#3.
+#
+# ONE caller job per fleet. It reconciles: it works out how many boxes the work
+# in front of it needs, compares that to how many are already up, and starts the
+# difference. There is no primary box and no overflow box, only a list of boxes
+# tried in order.
+#
+# Usage from a caller repository:
+#
+#   jobs:
+#     start-runners:
+#       uses: aleo-labs-flex/gh-actions/.github/workflows/start-runner.yml@v1
+#       permissions: { id-token: write, contents: read, actions: read }
+#       with:
+#         role-to-assume: ${{ vars.RUNNER_ROLE_ARN }}
+#         # Without this the census step is skipped and busy is 0: the key
+#         # alone mints nothing.
+#         runner-app-id: ${{ vars.RUNNER_APP_ID }}
+#       secrets: inherit
+#       # Keep the fork guard in the CALLER, where whoever edits that file sees
+#       # it. It is also enforced here, as defence in depth.
+#       if: >-
+#         github.event_name != 'pull_request_target' &&
+#         (github.event.pull_request == null ||
+#          github.event.pull_request.head.repo.full_name == github.repository)
+#
+#     gpu-test:
+#       needs: start-runners
+#       runs-on: [self-hosted, linux, x64, gpu, sm_89]
+#       ...
+#
+# The same workflow starts the CPU boxes for jobs that never needed a GPU: pass
+# a `fleet` naming the CPU boxes, `label: cpu`, and a `ladder` of CPU shapes.
+# See "A CPU box for the jobs that never needed a GPU" in the aws-dev-infra README.
+#
+# HOW MANY BOXES. Two terms, and the reason for each:
+#
+#   want = min( busy + max(1, ceil(queued / jobs-per-box)), fleet size )
+#
+# `queued` is this repository's demand for the label: the jobs this run is about
+# to release, taken from what this workflow released on recent runs, plus the
+# jobs already queued by its OTHER runs. The run's own jobs are not in the API
+# while this step runs -- they carry `needs:` on it, so GitHub has not created
+# them -- so counting the queue alone returns 0 for the caller that is asking,
+# every time. GITHUB_TOKEN cannot see another repository's runs either way, so
+# this term is necessarily per-repo.
+#
+# `busy` is every box in the fleet that is already running someone's job --
+# ONE org-wide call, whatever the number of repositories. It is what makes the
+# sum right across repositories without counting their queues: boxes busy with
+# another repo's work cannot take ours, so our own queue needs capacity ON TOP
+# of them. Without it, the second repository to arrive sees boxes already up,
+# concludes the fleet is big enough, and starts nothing while its jobs wait.
+# See aws-dev-infra#55; the credential is optional and busy falls back to 0.
+#
+# The floor of 1 is what keeps a miscount from hanging a run for 24h: a label
+# nobody offers, a caller that forgot actions:read, a rate-limited API all count
+# zero, and a job whose `runs-on` no runner answers queues for a day before
+# GitHub gives up. Calling this workflow at all means at least one box is wanted.
+#
+# The app must be SINGLE-PURPOSE. A key in CI secrets can mint every permission
+# its app holds, so the app that administers this fleet -- which can write org
+# secrets -- must not be the one whose key goes there. See aws-dev-infra#55.
+#
+# The role ARN is an INPUT rather than read from `vars` here on purpose: how the
+# `vars` context resolves inside a reusable workflow is not something to leave to
+# inference for a value that decides which AWS role gets assumed. The caller
+# passes it explicitly and can see what it passed.
+name: start-runner
+
+on:
+  workflow_call:
+    inputs:
+      role-to-assume:
+        description: >-
+          IAM role ARN for the caller to assume by OIDC. Must permit
+          ec2:StartInstances and ec2:ModifyInstanceAttribute on every instance
+          in `fleet`, plus ec2:DescribeInstances. Normally vars.RUNNER_ROLE_ARN.
+        required: true
+        type: string
+      aws-region:
+        description: Region the runner boxes live in.
+        required: false
+        default: us-west-2
+        type: string
+      fleet:
+        description: >-
+          Name tags of the boxes this label is served by, in the order they
+          should be started. IAM scopes StartInstances to these tags. Adding a
+          box to the fleet is this one string, in one place.
+        required: false
+        default: gpu-runner gpu-runner2 gpu-runner3 gpu-runner4
+        type: string
+      label:
+        description: The runner label whose queued jobs are counted.
+        required: false
+        # Must be a label the runners actually carry: counting a label nobody
+        # offers counts zero forever, and zero is indistinguishable from an idle
+        # repository. The floor of 1 keeps that from hanging a run, but the
+        # fleet would never grow past one box however deep the queue got.
+        default: gpu
+        type: string
+      jobs-per-box:
+        description: >-
+          Queued jobs one box is expected to absorb before another is worth
+          starting. This is a throughput/cost dial and the only number that
+          decides fleet size, so it lives here rather than in each caller.
+
+          3 is calibrated against dps, the busiest caller: one PR's worth of cpu
+          jobs wakes a couple of boxes, and each further PR in flight wakes
+          more. More boxes for a single PR is more hardware than that PR can
+          use; a box still asleep under several PRs' jobs is a queue nobody is
+          serving.
+
+          Not 1, and the reason is billing rather than cache: starting a box
+          buys a boot plus a minimum idle window before it stops itself again,
+          so a single short job does not pay for one. The box is usually WARM --
+          its root volume persists across stop/start, so sccache and the target
+          directory survive; it is genuinely cold only on its first use ever, or
+          after the disk guard has swept it.
+        required: false
+        default: 3
+        type: number
+      runner-org:
+        description: >-
+          Organisation whose runners are counted. Defaults to the caller's own,
+          which is right while the fleet and its callers share one org; a caller
+          elsewhere must name the org the runners are registered to, or the
+          count is of a fleet that is not theirs.
+        required: false
+        default: ''
+        type: string
+      runner-app-id:
+        description: >-
+          App id matching runner_app_key. Both or neither -- a key without an id
+          mints nothing, and the census silently falls back to busy=0.
+        required: false
+        default: ''
+        type: string
+      ladder:
+        description: >-
+          Instance types a box may be retyped to when its AZ has no capacity,
+          widest first; the chain starts at the box's PreferredInstanceType tag
+          and only steps down. The default is the Ada ladder; a CPU box passes
+          its own, e.g. "c6i.8xlarge c6a.8xlarge m6i.8xlarge".
+        required: false
+        default: g6.4xlarge g6.2xlarge g6.xlarge g6e.xlarge
+        type: string
+      capacity-retry-seconds:
+        description: >-
+          How long a fleet with nothing online keeps trying every box at every
+          shape on its ladder, a round at a time, before giving up.
+        required: false
+        default: 1500
+        type: number
+
+    secrets:
+      runner_app_key:
+        description: >-
+          Private key of a GitHub App that may READ the org's self-hosted
+          runners, used to count the boxes already busy with other repositories'
+          work. Optional: without it that term is 0 and each repository sizes the
+          fleet from its own queue alone, which under-provisions once more than
+          one repository is busy at a time.
+
+          Use a SINGLE-PURPOSE app. A key in CI secrets can mint every
+          permission its app holds, so an app that can also write secrets hands
+          that to anything able to run a workflow here.
+        required: false
+
+# No permissions block: a called workflow may only narrow what the caller
+# grants, and naming actions:read here would break every caller that does not
+# grant it. This needs id-token:write, contents:read and actions:read.
+
+jobs:
+  start:
+    runs-on: ubuntu-latest
+    # A backstop, not a budget: capacity-retry-seconds (1500s) plus the last
+    # round and an `aws ec2 wait instance-stopped`. Cut short, the job is
+    # cancelled red with no ::error:: annotation.
+    timeout-minutes: 60
+    env:
+      # A step-level `if` cannot read `secrets`: the expression does not compile
+      # and the whole workflow fails for every caller. Hoisted to job level,
+      # where it can be read.
+      HAS_RUNNER_APP_KEY: ${{ secrets.runner_app_key != '' }}
+    # SECURITY: callers must never invoke this from a `pull_request_target`
+    # workflow. That runs with a writable token in the base repo's context,
+    # which on a self-hosted runner with a persistent disk means a fork PR
+    # executes in our AWS account. Enforced here as well as in the caller,
+    # because a caller can forget and this cannot.
+    #
+    # The first clause is the one that does that, and an earlier version of this
+    # guard did not have it: `github.event_name != 'pull_request'` is TRUE for a
+    # pull_request_target event, so `||` short-circuited and the head-repo check
+    # never ran. It refused fork PRs on the trigger that already hands out a
+    # read-only token with no secrets, and admitted the trigger where the token
+    # is writable and the secrets are present -- the precise case the comment
+    # above says it exists for.
+    #
+    # `== null` rather than an event_name test for the second clause: push,
+    # schedule and workflow_dispatch carry no pull_request object at all, so
+    # this stays correct for triggers nobody has added yet.
+    if: >-
+      github.event_name != 'pull_request_target' &&
+      (github.event.pull_request == null ||
+       github.event.pull_request.head.repo.full_name == github.repository)
+    steps:
+      - uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        id: runner-app
+        if: env.HAS_RUNNER_APP_KEY == 'true' && inputs.runner-app-id != ''
+        # Best effort, always: a missing id, a key that does not match, or an app
+        # not installed here must fall back to busy=0, not redden a run.
+        continue-on-error: true
+        with:
+          app-id: ${{ inputs.runner-app-id }}
+          private-key: ${{ secrets.runner_app_key }}
+          owner: ${{ github.repository_owner }}
+          permission-organization-self-hosted-runners: read
+
+      - name: Count the boxes already busy
+        id: census
+        # Best effort, like the token step: a fleet this cannot see is sized
+        # from the caller's own queue, which is smaller, never larger.
+        continue-on-error: true
+        if: steps.runner-app.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.runner-app.outputs.token }}
+          LABEL: ${{ inputs.label }}
+          FLEET: ${{ inputs.fleet }}
+          ORG: ${{ inputs.runner-org != '' && inputs.runner-org || github.repository_owner }}
+        run: |
+          set -euo pipefail
+          # Captured before it is parsed: a 403 or a rate limit parsed as JSON
+          # would come back as "no runners", which is busy=0 -- the same answer
+          # as an idle fleet, but arrived at without looking.
+          json=$(gh api --paginate "/orgs/${ORG}/actions/runners?per_page=100" --jq '.runners[]' | jq -s '{runners: .}') \
+            || { echo "::warning::could not list ${ORG} runners; sizing from this repo's queue alone" >&2; exit 0; }
+          # BUSY, not online-minus-idle. Registration is deliberately persistent
+          # and the boxes stop themselves when idle, so a stale registration
+          # lingers up to 24h after a box is gone; `busy` is false for those.
+          #
+          # Counted in BOXES, which is the unit the plan step adds it to -- that
+          # side counts EC2 instances. Two corrections get it there:
+          #
+          #   * a box with RUNNER_SLOTS > 1 registers one runner per slot, named
+          #     NAME-1, NAME-2 (runner-install.sh). Counting registrations would
+          #     make one fully-busy box read as three and take `want` straight
+          #     to the fleet cap -- every box started for a queue one box is
+          #     already draining. Slots are pinned to 1 today, so this is a
+          #     latent unit error rather than a live one, which is the kind
+          #     worth closing while the reason is still visible.
+          #   * a runner elsewhere in the org carrying the same label is not in
+          #     this fleet, and starting our boxes would not relieve it.
+          busy=$(jq --arg l "$LABEL" --arg fleet "$FLEET" '
+            ($fleet | split(" ")) as $f
+            | [ .runners[]
+                | select(.labels[].name == $l)
+                | select(.busy and .status == "online")
+                | (.name | sub("-[0-9]+$"; ""))
+                | select(. as $n | $f | index($n)) ]
+            | unique | length' <<<"$json")
+          echo "${LABEL} boxes busy with someone's job: ${busy} (of ${FLEET})"
+          echo "busy=${busy}" >> "${GITHUB_OUTPUT}"
+
+      - name: Measure the queue
+        id: queue
+        # Best effort: a caller that forgot actions:read, or an API that
+        # refuses, must still get the one box the floor guarantees rather than a
+        # red run -- and a red run here would not have started a box either.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: ${{ inputs.label }}
+        run: |
+          set -euo pipefail
+          # THIS run's own jobs are not in the API yet, and that is not a race:
+          # the jobs that need a box carry `needs:` on this workflow, so GitHub
+          # has not created them. At this instant the run holds exactly one job
+          # -- this one, on ubuntu-latest. Counting the API alone therefore
+          # returns 0 for the caller that is asking, every single time, and the
+          # fleet never grows past the floor however much work is about to be
+          # released.
+          #
+          # Measured, not reasoned about: dps releases five `cpu` jobs per run,
+          # and this step reported `queued cpu jobs: 0`. The old three-caller
+          # layout hid it -- the overflow callers ran with `needs:` on the
+          # primary, so by the time they counted, the jobs were real.
+          #
+          # So this run's own demand is taken from the last completed run of the
+          # same workflow, and the API is asked only about the OTHER runs.
+          own=0
+          ref="${GITHUB_WORKFLOW_REF:-}"         # owner/repo/.github/workflows/x.yml@ref
+          # %%@*, not %@*: the shortest-suffix form cuts at the LAST @, and a
+          # git ref may contain one (only `@{` is forbidden). On a branch or tag
+          # like `v1@rc`, wf_path kept an @-fragment and matched no run's .path
+          # -- silently disabling the sibling-run crediting below, which is the
+          # thing that keeps two pushes landing together from each sizing for
+          # one run's demand. A workflow path cannot contain @.
+          wf_path="${ref#*/}"; wf_path="${wf_path#*/}"; wf_path="${wf_path%%@*}"
+          wf="${wf_path##*/}"
+          if [ -n "${wf}" ]; then
+            # SEVERAL completed runs and the largest, not the newest one. A run
+            # cancelled while its start job was still going -- a second push to
+            # the same branch, or someone hitting cancel -- has only the
+            # ubuntu-latest start job on record, and so does a fork PR, where
+            # the guard skips the start job and everything gated behind it.
+            # Reading just the newest would report 0 for those and fall back to
+            # the floor: the same silent undersizing this replaces, arrived at
+            # by a different route.
+            if hist=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?status=completed&per_page=5" \
+                        --jq '.workflow_runs[].id' 2>/dev/null); then
+              for r in ${hist}; do
+                # Job records, not queue: every job the run created that carried
+                # the label, whatever it concluded. A matrix is counted by its
+                # legs rather than by the one entry that spawned them, which
+                # reading the workflow file could not do.
+                k=$(gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/runs/${r}/jobs?per_page=100" --jq '.jobs[]' 2>/dev/null \
+                    | jq --arg l "${LABEL}" -s '[.[] | select(.labels | index($l))] | length') || k=0
+                [ "${k}" -gt "${own}" ] && own="${k}"
+              done
+            else
+              # Named, because "0" from a rate-limited listing and "0" from a
+              # workflow that has never completed a run print the same line --
+              # and the first is a regression hiding as the second.
+              echo "::warning::could not read this workflow's history; sizing ${LABEL} without it" >&2
+            fi
+          fi
+          echo "${LABEL} jobs this workflow releases per run: ${own}"
+
+          # Whatever goes wrong from here, the demand already measured is
+          # worth keeping: `own` is often the whole of this run's need, and
+          # throwing it away for one flaky listing hands a 15-job queue the
+          # floor of one box.
+          bail() { echo "::warning::$1" >&2; echo "queued=${own}" >> "${GITHUB_OUTPUT}"; exit 1; }
+
+          # Runs listed as queued or in_progress can both hold a job still
+          # waiting for a runner. This run is excluded: its demand is `own`
+          # above, and a rerun whose jobs HAVE been released would otherwise be
+          # counted twice.
+          #
+          # Both listings are gathered before any are counted, then deduplicated
+          # by run id: a run that is `queued` during the first call and
+          # `in_progress` during the second appears in both, and would otherwise
+          # be counted twice -- including a full `own` worth, for a sibling run
+          # of this workflow.
+          seen=""
+          for status in queued in_progress; do
+            # Captured first: a failing command in a `for` word list is invisible
+            # to set -e, and a 403 (the caller did not grant actions:read) or a
+            # rate limit would otherwise read as an empty queue.
+            runs=$(gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/runs?status=${status}&per_page=100" --jq '.workflow_runs[] | "\(.id) \(.path)"') \
+              || bail "could not list ${status} runs; does the caller grant actions: read?"
+            seen="${seen}${seen:+$'\n'}${runs}"
+          done
+          others=0
+          while read -r run path; do
+            [ -n "${run}" ] || continue
+            [ "${run}" = "${GITHUB_RUN_ID:-}" ] && continue
+            jobs=$(gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/runs/${run}/jobs?per_page=100" --jq '.jobs[]') \
+              || bail "could not list the jobs of run ${run}"
+            k=$(jq --arg l "${LABEL}" -s '[.[] | select(.status == "queued" and (.labels | index($l)))] | length' <<<"${jobs}")
+            if [ "${k}" -eq 0 ] && [ "${path}" = "${wf_path}" ]; then
+              any=$(jq --arg l "${LABEL}" -s '[.[] | select(.labels | index($l))] | length' <<<"${jobs}")
+              # A run of THIS workflow with no label jobs on record is another
+              # start job holding them behind `needs`, exactly as this one is
+              # -- invisible to the queue for the same reason. Two pushes
+              # landing together is the case the fleet most needs to absorb,
+              # and without this each run sizes for its own demand alone and
+              # both ask for the same two boxes.
+              [ "${any}" -eq 0 ] && k="${own}"
+            fi
+            others=$((others + k))
+          done <<<"$(printf '%s\n' "${seen}" | awk 'NF && !dup[$1]++')"
+          echo "queued ${LABEL} jobs in other ${GITHUB_REPOSITORY} runs: ${others}"
+          echo "queued=$((own + others))" >> "${GITHUB_OUTPUT}"
+
+      - name: Size the fleet to the work
+        id: plan
+        env:
+          FLEET: ${{ inputs.fleet }}
+          LABEL: ${{ inputs.label }}
+          JOBS_PER_BOX: ${{ inputs.jobs-per-box }}
+          # Unset when the step failed or never ran; both mean "could not see",
+          # and both are worth the floor rather than an error.
+          QUEUED: ${{ steps.queue.outputs.queued }}
+          BUSY: ${{ steps.census.outputs.busy }}
+          HAVE_CENSUS: ${{ steps.census.outputs.busy != '' }}
+        run: |
+          set -euo pipefail
+          read -ra boxes <<<"${FLEET}"
+          size=${#boxes[@]}
+          [ "${size}" -gt 0 ] || { echo "::error::fleet is empty" >&2; exit 1; }
+          queued="${QUEUED:-0}"; busy="${BUSY:-0}"
+          per="${JOBS_PER_BOX}"
+          # A zero would divide by zero and a negative would shrink the fleet
+          # below its floor; neither is a number anyone means to pass.
+          [ "${per}" -ge 1 ] || per=1
+          # Ceiling division, then floored at one box for THIS caller -- the
+          # floor belongs on our own term, not on the sum. Flooring the sum
+          # instead reads as satisfied by boxes that are busy with someone
+          # else's work: a caller that forgot actions:read counts zero, `want`
+          # collapses to `busy`, every busy box is already online, and nothing
+          # starts -- so this repo queues behind the other one's jobs on exactly
+          # the miscount the floor exists to survive.
+          #
+          # Zero does reach here, and legitimately: a workflow with no
+          # completed run to learn from has no history to size by. One box is
+          # the right answer for that, and the next run will know better.
+          need=$(( (queued + per - 1) / per ))
+          [ "${need}" -ge 1 ] || need=1
+          want=$(( busy + need ))
+          [ "${want}" -le "${size}" ] || want="${size}"
+          if [ "${HAVE_CENSUS}" != "true" ]; then
+            echo "::notice::no runner census; sizing ${LABEL} from this repository's queue alone. Other repositories' load is invisible, so the fleet may be undersized (aws-dev-infra#55)."
+          fi
+          echo "${LABEL}: ${queued} queued here + ${busy} boxes busy elsewhere, ${per} per box -> want ${want} of ${size}"
+          echo "want=${want}" >> "${GITHUB_OUTPUT}"
+
+      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Start what the fleet is short
+        env:
+          FLEET: ${{ inputs.fleet }}
+          LABEL: ${{ inputs.label }}
+          WANT: ${{ steps.plan.outputs.want }}
+          LADDER: ${{ inputs.ladder }}
+          CAPACITY_RETRY_SECONDS: ${{ inputs.capacity-retry-seconds }}
+        run: |
+          set -euo pipefail
+
+          # One box failing to start is not the run's problem as long as another
+          # took its place, so a box reports and returns; only the fleet ending
+          # up empty is an error. That is the whole of what used to be the
+          # primary/overflow distinction.
+          warn() { echo "::warning::$*"; }
+
+          # Seconds between rounds. A name so test-multibox.sh can set it to 0;
+          # only the throttle test, which measures it, sets it low instead.
+          RETRY_SLEEP="${RETRY_SLEEP_SECONDS:-20}"
+
+          # <class>-runner<n> is the role <class><n>: cpu-runner -> cpu,
+          # gpu-runner2 -> gpu2. Stripping "-runner" alone leaves a third box as
+          # "cpu-runner3", a role lib.sh refuses -- the notice named a command
+          # that errors.
+          role_of() {
+            case "$1" in
+              *-runner|*-runner[0-9]*) printf '%s%s' "${1%-runner*}" "${1##*-runner}" ;;
+              *) printf '%s' "$1" ;;
+            esac
+          }
+
+          # One StartInstances call, no waiting: the round loop below is the
+          # only retry, and its sleep the only throttle.
+          #   0 started, 1 no capacity, 2 still stopping (try it next round),
+          #   3 give up on this box.
+          # 2 and 3 are never "this shape is full". A box caught mid-shutdown --
+          # the routine state here, since the boxes stop themselves -- or
+          # refused for a permission would start as no other shape either, and
+          # treating either as a capacity refusal walked the box down its whole
+          # ladder, blaming capacity at every step.
+          try_start() {
+            local err
+            err=$(aws ec2 start-instances --instance-ids "$1" 2>&1) && return 0
+            case "${err}" in
+              *InsufficientInstanceCapacity*) return 1 ;;
+              *IncorrectInstanceState*) return 2 ;;
+              *VcpuLimitExceeded*) warn "starting $1 would exceed the account's vCPU quota; skipping it"; return 3 ;;
+              *) warn "${err}"; return 3 ;;
+            esac
+          }
+
+          # Sets CHAIN: the shapes a box may be started as, in the order to try
+          # them.
+          # $1 = instance id, $2 = current type, $3 = the PreferredInstanceType
+          # tag ("None" when the box predates it).
+          chain_of() {
+            local RUNNER_ID="$1" CURRENT="$2" PREFERRED="$3" seen=0 s
+            CHAIN=""
+
+            # --output text prints a literal "None" for a tag that is not there
+            # -- a box provisioned before aws-dev-infra started writing it, or one
+            # from another stack. Treat that as "whatever it is now is what it
+            # wants", which is exactly the behaviour this job had before the tag
+            # existed.
+            if [ -z "${PREFERRED}" ] || [ "${PREFERRED}" = "None" ]; then
+              PREFERRED="${CURRENT}"
+            fi
+            if [ "${CURRENT}" != "${PREFERRED}" ]; then
+              echo "::notice::${RUNNER_ID} is ${CURRENT} but is configured for ${PREFERRED}; a past capacity shortfall left it there. Trying ${PREFERRED} first."
+            fi
+            # g6f.xlarge, a fractional L4 (2861 MiB), cannot build snarkVM-cuda's
+            # 3 GiB device pool (snarkVM-cuda#203). A box an older ladder left
+            # there is moved off it, and never tried as itself below.
+            if [ "${CURRENT}" = "g6f.xlarge" ]; then
+              warn "this box is currently g6f.xlarge, a fractional L4 that cannot run the CUDA suite; retyping it to a full-size shape"
+              [ "${PREFERRED}" = "g6f.xlarge" ] && PREFERRED=g6.xlarge
+            fi
+
+            # The chain starts at the shape the box is CONFIGURED for and only
+            # ever steps DOWN this ladder. Both halves of that matter:
+            #
+            #   * starting at the configured shape is what breaks the ratchet.
+            #     The chain used to start at CURRENT, so once an outage retyped a
+            #     box down there was nothing that would ever take it back up, and
+            #     a runner silently built on 4 vCPUs instead of its configured 16
+            #     until someone read status.sh's "*" and did it by hand.
+            #   * only stepping down is what keeps a box from growing past its
+            #     configured shape into the rest of the fleet's share of the
+            #     quota on a capacity retry.
+            for s in ${LADDER}; do
+              [ "${s}" = "${PREFERRED}" ] && seen=1
+              [ "${seen}" = 1 ] && CHAIN="${CHAIN}${CHAIN:+ }${s}"
+            done
+            # A preferred shape that is not on the ladder at all -- an override,
+            # a future type, or a CPU box started without its own ladder -- is
+            # tried on its own. Walking a ladder it is not on would retype it
+            # into shapes it never asked for: a c6i onto a g6.
+            if [ -z "${CHAIN}" ]; then
+              warn "${PREFERRED} is not on the ladder (${LADDER}); no capacity fallback for this box"
+              CHAIN="${PREFERRED}"
+            fi
+            # Whatever the box is right now is tried too -- but ONLY when it is
+            # off the ladder entirely. Anything on the ladder at or below
+            # PREFERRED is already in CHAIN above; anything on it ABOVE
+            # PREFERRED is a shape this box must never be given, and appending
+            # it unconditionally is how the chain came to step UP.
+            case " ${LADDER} g6f.xlarge " in
+              *" ${CURRENT} "*) ;;
+              *) case " ${CHAIN} " in
+                   *" ${CURRENT} "*) ;;
+                   *) CHAIN="${CHAIN} ${CURRENT}" ;;
+                 esac ;;
+            esac
+          }
+
+          # Found by tag rather than held in a variable. An instance id does not
+          # survive a destroy + reprovision, and moving the runners to a
+          # dedicated CI account later would change them too; the tags do not.
+          # StartInstances is itself tag-scoped in IAM, so a wrong lookup cannot
+          # start something else.
+          #
+          # One call for the whole fleet: the boxes register under their Name
+          # tag, so this is also the inventory the plan above is spending.
+          read -ra boxes <<<"${FLEET}"
+          if ! inv=$(aws ec2 describe-instances \
+              --filters "Name=tag:Name,Values=$(IFS=,; echo "${boxes[*]}")" \
+                        "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+              --query "Reservations[].Instances[].[Tags[?Key=='Name']|[0].Value,InstanceId,InstanceType,State.Name,Tags[?Key=='PreferredInstanceType']|[0].Value]" \
+              --output text); then
+            echo "::error::could not describe the ${LABEL} fleet (${FLEET})" >&2
+            exit 1
+          fi
+
+          # The boxes that could be started, in fleet order, as parallel arrays.
+          online=0
+          tags=(); ids=(); cur=(); states=(); chains=(); fate=(); last=()
+          depth=0
+          for tag in "${boxes[@]}"; do
+            match=$(awk -v t="${tag}" '$1 == t' <<<"${inv}")
+            n=$(printf '%s' "${match}" | grep -c . || true)
+            case "${n}" in
+              0) echo "::notice::no instance tagged ${tag}; that box is not provisioned (ROLE=$(role_of "${tag}") ./provision.sh)"
+                 continue ;;
+              1) ;;
+              *) warn "expected one instance tagged ${tag}, found ${n}; leaving it alone"
+                 continue ;;
+            esac
+            # Tab-delimited and read back with IFS, not split on spaces: a
+            # PreferredInstanceType tag whose value is empty makes the last
+            # field empty, and `set -- ${c}` then leaves $4 unbound -- which
+            # under `set -u` killed the step with a bare bash error, no
+            # ::error:: annotation and no box started.
+            IFS=$'\t' read -r _ id type state preferred <<<"${match}"
+            case "${state}" in
+              # StartInstances is idempotent over running and pending, but
+              # counting them as already-online is what keeps concurrent runs
+              # from each starting a box for the same queue.
+              pending|running) online=$((online + 1)); echo "${tag} (${id}) is ${state} as ${type}" ;;
+              *)
+                chain_of "${id}" "${type}" "${preferred:-None}"
+                echo "${tag} (${id}): ${type}, will try ${CHAIN}"
+                tags+=("${tag}"); ids+=("${id}"); cur+=("${type}"); states+=("${state}")
+                chains+=("${CHAIN}"); fate+=(pending); last+=("")
+                read -ra c <<<"${CHAIN}"
+                [ "${#c[@]}" -le "${depth}" ] || depth=${#c[@]}
+                ;;
+            esac
+          done
+
+          # One round tries every (shape, box) pair once: widest shape first,
+          # and within a shape in fleet order, so a fleet that needs one box
+          # wakes the same one whenever it can -- concurrent runs make the same
+          # choice, and the box that gets the most use has the warmest caches.
+          #
+          # A box caught mid-stop ends the round at the shape it was asked for,
+          # rather than let the others step down past it: it is routinely one
+          # sleep away from starting at full size.
+          #
+          # Only a box the caller is BLOCKED on walks its chain. Once anything
+          # is online, a box gets one try at its configured shape and nothing
+          # else: a single momentary refusal would otherwise retype a box that
+          # is only throughput down every shape in milliseconds.
+          sweep() {
+            local r i t rc chain stopping=0
+            for ((r = 0; r < depth; r++)); do
+              for i in "${!ids[@]}"; do
+                [ $((online + started)) -lt "${WANT}" ] || return 0
+                [ "${fate[i]}" = pending ] || continue
+                [ "${r}" -eq 0 ] || [ $((online + started)) -eq 0 ] || continue
+                read -ra chain <<<"${chains[i]}"
+                t="${chain[r]:-}"
+                [ -n "${t}" ] || continue
+                if [ "${t}" != "${cur[i]}" ]; then
+                  # A stopped instance cannot change AZ, but it CAN change type,
+                  # keeping its root volume -- only while stopped, hence the
+                  # wait. Only for a box the inventory found mid-stop: `wait
+                  # instance-stopped` on a box that is NOT stopping blocks for
+                  # 600s and then fails, with `|| true` hiding it.
+                  if [ "${states[i]}" = stopping ]; then
+                    aws ec2 wait instance-stopped --instance-ids "${ids[i]}" || true
+                    states[i]=stopped
+                  fi
+                  if ! aws ec2 modify-instance-attribute --instance-id "${ids[i]}" --instance-type "${t}"; then
+                    warn "could not retype ${ids[i]} to ${t}"
+                    fate[i]=dropped
+                    continue
+                  fi
+                  cur[i]="${t}"
+                fi
+                rc=0; try_start "${ids[i]}" || rc=$?
+                last[i]="${rc}"
+                case "${rc}" in
+                  0) fate[i]=started; started=$((started + 1))
+                     echo "started ${tags[i]} as ${t}"
+                     [ "${r}" -eq 0 ] || warn "${tags[i]} started as ${t} instead of its configured ${chain[0]}: no capacity for it in its AZ"
+                     ;;
+                  1) echo "${tags[i]}: no ${t} capacity in its AZ" ;;
+                  2) echo "${tags[i]} is mid-stop; trying it again next round"; stopping=1 ;;
+                  3) fate[i]=dropped ;;
+                esac
+              done
+              [ "${stopping}" = 0 ] || return 0
+            done
+          }
+
+          started=0
+          # Guarded: bash before 4.4 treats an empty array as unset under -u.
+          if [ "${#ids[@]}" -gt 0 ]; then
+            patient=0
+            [ "${online}" -eq 0 ] && patient=1
+            deadline=$((SECONDS + patient * CAPACITY_RETRY_SECONDS))
+            while :; do
+              for i in "${!ids[@]}"; do last[i]=""; done
+              sweep
+              if [ $((online + started)) -gt 0 ] || [ "${SECONDS}" -ge "${deadline}" ]; then break; fi
+              printf '%s\n' "${fate[@]}" | grep -qx pending || break
+              echo "nothing started this round; trying every box and shape again in ${RETRY_SLEEP}s"
+              sleep "${RETRY_SLEEP}"
+            done
+
+            for i in "${!ids[@]}"; do
+              if [ "${fate[i]}" != pending ] || [ -z "${last[i]}" ]; then continue; fi
+              read -ra c <<<"${chains[i]}"
+              if [ "${last[i]}" = 2 ]; then
+                warn "${ids[i]} is still stopping; leaving it for the next run rather than retyping it"
+              elif [ $((online + started)) -eq 0 ]; then
+                warn "could not start ${ids[i]} as any of its shapes (tried: ${chains[i]})"
+              elif [ "${cur[i]}" = "${c[0]}" ]; then
+                warn "no ${cur[i]} capacity for ${tags[i]}; leaving it on its configured shape rather than retyping a box nothing is waiting for"
+              else
+                warn "no capacity for ${tags[i]} down to ${cur[i]}; it is left stopped as ${cur[i]}, and the next run retypes it back to ${c[0]}"
+              fi
+            done
+          fi
+
+          total=$((online + started))
+          echo "${LABEL} fleet: ${total} online (${online} already up, ${started} started), wanted ${WANT}"
+          if [ "${total}" -eq 0 ]; then
+            echo "::error::no box carrying ${LABEL} is online and none could be started; jobs needing it queue for 24h before GitHub gives up" >&2
+            exit 1
+          fi
+          if [ "${total}" -lt "${WANT}" ]; then
+            warn "wanted ${WANT} ${LABEL} boxes, have ${total}; the queue will drain slower"
+          fi

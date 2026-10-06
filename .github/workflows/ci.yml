@@ -1,0 +1,25 @@
+# Lint and test the workflow and actions. Nothing here holds AWS credentials or
+# can start an instance.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with: { persist-credentials: false }
+      - name: Shellcheck
+        run: shellcheck -x --severity=warning ./*.sh
+      - name: Shellcheck (workflow and action YAML)
+        run: ./lint-workflow-shell.sh
+      - name: Tests
+        run: ./test.sh

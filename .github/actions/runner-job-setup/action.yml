@@ -1,0 +1,118 @@
+# What a job does on a self-hosted box before its own build starts: the disk
+# preflight, a target directory that survives checkout, and the box's sccache
+# settings put where a job-level `env:` cannot silently drop them, behind the
+# box's rustup lock. Everything else a job used to set up here -- NVCC, the
+# build parallelism -- is the box's to decide, and comes to the job through the
+# runner's .env (runner-install.sh).
+#
+# Every step is gated on runner.environment, so a caller can leave this in a job
+# that sometimes runs on a hosted runner: there it does nothing.
+#
+# The disk step is NOT identical to gpu-runner-preflight's: this one protects
+# the target dir it just named, which on a one-slot box is shared and lives
+# outside the work root, while gpu-test keeps its target beside the checkout so
+# protecting the work root covers it. The test pins what must stay aligned --
+# the guard path and the missing-guard refusal -- rather than the whole step.
+name: Runner job setup
+description: Disk preflight, a persistent target dir and sccache, on a self-hosted box only.
+
+inputs:
+  disk-guard:
+    description: Path to runner-disk-guard on the box.
+    required: false
+    default: /usr/local/bin/runner-disk-guard
+  target:
+    description: >-
+      Name of the FALLBACK target directory, under the slot's work root where
+      runner-disk-guard caps it. checkout's `git clean -ffdx` wipes a target
+      inside the checkout every job, so a target there is never incremental. A
+      matrix job appends its axis, e.g. ci-<job id>-<arch>.
+
+      Ignored where the box sets CI_TARGET_ROOT: on a one-slot box every job of
+      a repository shares one target dir (aws-dev-infra#48). Defaults to
+      ci-<job id>, resolved in the step: an input default cannot read the
+      github context, and neither can this text -- GitHub evaluates an
+      expression anywhere in the file, a description included, and rejects
+      the action at load.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    # First, because the preflight below protects the directory this names.
+    #
+    # CI_TARGET_ROOT is the box's: runner-install.sh sets it only where one slot
+    # makes a shared dir safe, so every job of a repository builds in one target
+    # dir (aws-dev-infra#48, and its README "The target directory is part of the
+    # cache key"). Unset, it is a dir per job, as before.
+    - name: Target directory
+      if: runner.environment == 'self-hosted'
+      shell: bash
+      env:
+        TARGET_NAME: ${{ inputs.target || format('ci-{0}', github.job) }}
+      run: |
+        set -euo pipefail
+        if [ -n "${CI_TARGET_ROOT:-}" ]; then
+          target="${CI_TARGET_ROOT}/${GITHUB_REPOSITORY/\//-}"
+        else
+          target="${RUNNER_WORKSPACE}/${TARGET_NAME}-target"
+        fi
+        mkdir -p "${target}"
+        # runner-disk-guard finds build dirs by CACHEDIR.TAG or .rustc_info.json
+        # (MARKERS in runner-disk-guard.sh). cargo writes the tag only when it
+        # creates the target dir ITSELF -- so mkdir -p above means cargo never
+        # tags it, and the guard cannot see the dir until a build has written
+        # .rustc_info.json. Measured on cpu-runner before either fix: 7 of 8
+        # target dirs untagged, 65% of the build cache outside the cap. Write
+        # the tag here, so it does not depend on who made the directory.
+        printf 'Signature: 8a477f597d28d172789f06886806bc55\n' > "${target}/CACHEDIR.TAG"
+        echo "CARGO_TARGET_DIR=${target}" >> "${GITHUB_ENV}"
+        echo "reusing ${target}"
+
+    # These four arrive on the bottom rung of the precedence ladder, where any
+    # workflow- or job-level `env:` block silently overrode them (aws-dev-infra#58,
+    # and its README "What a workflow can override"); GITHUB_ENV is a rung up.
+    #
+    # Read from the box's file, not this step's environment -- an override is
+    # already in force here, so copying what we see would re-assert it. From
+    # /etc/environment, which bootstrap.sh owns and every box already has,
+    # rather than the runner's .env, reachable only by walking up out of
+    # RUNNER_WORKSPACE. A box with sccache off has none of these lines and gets
+    # none of them: a value invented here would name a binary it never
+    # installed.
+    - name: sccache environment
+      if: runner.environment == 'self-hosted'
+      shell: bash
+      run: |
+        set -euo pipefail
+        # A box without the file builds slowly, rather than not at all: the
+        # preflight below is what refuses an unprovisioned box.
+        [ -r /etc/environment ] || exit 0
+        sed -n -E '/^(RUSTC_WRAPPER|CARGO_INCREMENTAL|SCCACHE_DIR|SCCACHE_CACHE_SIZE)=/{s/"//g;p;}' \
+          /etc/environment | tee -a "${GITHUB_ENV}"
+
+    - name: Disk preflight
+      if: runner.environment == 'self-hosted'
+      shell: bash
+      env:
+        DISK_GUARD: ${{ inputs.disk-guard }}
+      run: |
+        set -euo pipefail
+        if [ ! -x "${DISK_GUARD}" ]; then
+          echo "::error::${DISK_GUARD} is missing or not executable. The box was" \
+               "provisioned without install-runner.sh, or an older version of it." >&2
+          exit 1
+        fi
+        # The dir this job is about to fill. Since #33 protect orders rather
+        # than excludes, so this reads as "take mine last".
+        "${DISK_GUARD}" preflight "${CARGO_TARGET_DIR}"
+
+    # The slots share one ~/.rustup, and the first cargo call installs
+    # rust-toolchain.toml's channel if it is missing. Serialised, so jobs
+    # starting together do not race into the same toolchain dir -- and one
+    # lock name for every repository on the box, since ~/.rustup is per box.
+    - name: Rustup lock
+      if: runner.environment == 'self-hosted'
+      shell: bash
+      run: flock /tmp/rustup.lock cargo --version

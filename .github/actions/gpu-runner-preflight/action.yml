@@ -1,0 +1,164 @@
+# Everything a job should do on the GPU runner BEFORE its own build starts.
+#
+# A composite action rather than part of the reusable workflow because these are
+# steps inside a job the caller owns: the test command differs per repository
+# (`-p snarkvm-algorithms --features cuda` versus `--workspace --features
+# dps/cuda,dps/test_consensus_heights`), so the job itself cannot be shared.
+# See aws-dev-infra#3.
+name: GPU runner preflight
+description: Check disk headroom and report which GPU the job actually landed on.
+
+inputs:
+  disk-guard:
+    description: Path to runner-disk-guard on the box.
+    required: false
+    default: /usr/local/bin/runner-disk-guard
+  expected-gpu:
+    description: >-
+      Substring of the nvidia-smi name for the GPU this code deploys to. A job
+      landing on anything else gets a warning rather than passing silently.
+    required: false
+    default: L4
+  sample-interval:
+    description: >-
+      Seconds between GPU memory samples. A private-execution proof completes in
+      about seven seconds, so an interval of a second or more can miss the peak
+      entirely.
+    required: false
+    default: '0.5'
+  sampler-max-seconds:
+    description: >-
+      Self-timeout for the sampler, so one that outlives its job cannot run
+      forever. It is setsid-detached, so a cancelled job leaves nothing to kill
+      it -- RUNNER_TEMP being cleared removes its files, not the process.
+    required: false
+    default: '21600'
+
+runs:
+  using: composite
+  steps:
+    # The disk cap is enforced between jobs, and one cold build can overshoot it
+    # mid-flight, so check before rather than after. RUNNER_WORKSPACE -- the
+    # work dir for this repository, holding the checkout and the target beside
+    # it (gpu-test.yml keeps `${RUNNER_WORKSPACE}/gpu-test-target`, since git
+    # clean wipes one inside the checkout) -- is what sorts last, so this job's
+    # own target is the last thing dropped to make room rather than the one
+    # thing spared. Sparing it outright would leave one target outside the cap
+    # for as long as the job runs.
+    - name: Disk preflight
+      shell: bash
+      env:
+        DISK_GUARD: ${{ inputs.disk-guard }}
+      run: |
+        set -euo pipefail
+        if [ ! -x "${DISK_GUARD}" ]; then
+          echo "::error::${DISK_GUARD} is missing or not executable. The box was" \
+               "provisioned without install-runner.sh, or an older version of it." >&2
+          exit 1
+        fi
+        "${DISK_GUARD}" preflight "${RUNNER_WORKSPACE}"
+
+    # The capacity fallback in start-runner.yml can retype the box to a
+    # different Ada part. An L40S has roughly twice an L4's memory, so a test
+    # that would exhaust the deployment card passes on one. A green run on
+    # fallback hardware should say so rather than look identical.
+    - name: Which GPU actually ran
+      shell: bash
+      env:
+        EXPECTED_GPU: ${{ inputs.expected-gpu }}
+      run: |
+        set -euo pipefail
+        # `|| rc=$?` rather than letting `set -e` kill the step, and 2>&1 rather
+        # than a bare substitution, because nvidia-smi prints its failure to
+        # STDOUT: a plain `gpu=$(nvidia-smi ...)` captures the explanation into a
+        # variable that is never echoed and the job reports nothing but
+        # "Process completed with exit code 9". Diagnosing that once took an EC2
+        # console-log dump to reach a one-line answer (#10).
+        rc=0
+        gpu=$(nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv,noheader 2>&1) || rc=$?
+        if [ "${rc}" -ne 0 ]; then
+          echo "::error::nvidia-smi failed with exit ${rc}; this box has no usable GPU."
+          printf '%s\n' "${gpu}" >&2
+          if [ "${rc}" -eq 9 ]; then
+            echo "::error::Exit 9 is NVML's \"driver not loaded\". On a full-size" \
+                 "shape that is usually a kernel update the DKMS modules were not" \
+                 "rebuilt for; on a g6f, which only the GRID driver binds, it is expected."
+          fi
+          exit "${rc}"
+        fi
+        echo "${gpu}"
+        echo "ran on: ${gpu}" >> "${GITHUB_STEP_SUMMARY}"
+        # The trailing comma is load-bearing: nvidia-smi prints "NVIDIA L4, 8.9,
+        # ..." and "NVIDIA L40S, 8.9, ...", so a bare "L4" substring matches the
+        # L40S too and the warning would never fire on the exact case it exists
+        # for.
+        #
+        # A vGPU slice reports a PROFILE name -- "NVIDIA L4-3Q" on g6f.xlarge --
+        # which is the same silicon with less of it. That is its own case: the
+        # plain warning below says the box may be MORE capable than the
+        # deployment card (the L40S it was written for), and on a slice the
+        # concern is the exact opposite.
+        case "${gpu}" in
+          *"${EXPECTED_GPU},"*) ;;
+          *"${EXPECTED_GPU}-"*)
+            echo "::warning::ran on ${gpu} — a vGPU SLICE of the ${EXPECTED_GPU}, not a whole" \
+                 "one. Same sm_89, but a fraction of the memory and time-sliced SMs shared" \
+                 "with other tenants: a pass here is a correctness result, not a timing one" ;;
+          *) echo "::warning::ran on ${gpu}, not the ${EXPECTED_GPU} this code deploys to —" \
+                  "different GPU memory, so a failure that depends on the deployment card's" \
+                  "limits would not reproduce here" ;;
+        esac
+
+    # Peak GPU memory has to be sampled WHILE the tests run. An earlier version
+    # of this ran nvidia-smi once after them, which reports memory with the test
+    # process already exited -- a number that looks like a measurement and
+    # answers nothing. It is the whole question WHENEVER the box is not the card
+    # we deploy on: an L40S carries roughly twice an L4's memory and a g6f slice
+    # a fraction of it, so on either one "it passed" does not establish that it
+    # fits. On the configured g6.4xlarge the runner and the deployment card are
+    # the same L4, and the headroom line is then comparing the box against
+    # itself -- which is worth knowing when reading it, because it looks like
+    # slack and is not.
+    #
+    # Detached with setsid so it outlives this step. Each `run:` block is its own
+    # shell, and gpu-runner-report is a later step; without detaching, the
+    # sampler dies with the shell that started it.
+    - name: Start the GPU memory sampler
+      shell: bash
+      env:
+        SAMPLE_INTERVAL: ${{ inputs.sample-interval }}
+        SAMPLER_MAX_SECONDS: ${{ inputs.sampler-max-seconds }}
+      run: |
+        set -euo pipefail
+        # RUNNER_TEMP, not /tmp. GitHub empties RUNNER_TEMP at the start and end
+        # of every job, so nothing here can leak into another one. With /tmp
+        # this leaked BOTH ways: preflight rm -f'd a stale PID file without
+        # killing the process it named, orphaning that sampler permanently while
+        # a second one wrote the same peak file; and report never removed the
+        # peak file, so a later job that ran report without preflight would read
+        # the previous job's peak and print it as its own -- with the
+        # NOT MEASURED guard unable to fire, because the file existed and was
+        # numeric.
+        peak_file="${RUNNER_TEMP}/gpu-peak-mib"
+        pid_file="${RUNNER_TEMP}/gpu-sampler.pid"
+        rm -f "${peak_file}" "${pid_file}"
+        printf '0' > "${peak_file}"
+        # nounits so the value is a bare integer and -gt does not need parsing.
+        #
+        # shellcheck disable=SC2016
+        # The single quotes are the point: ${used} and ${peak} must expand in the
+        # DETACHED shell, not this one. Only ${SAMPLE_INTERVAL} is interpolated
+        # here, by closing and reopening the quotes around it.
+        setsid bash -c '
+          peak=0
+          deadline=$(( $(date +%s) + '"${SAMPLER_MAX_SECONDS}"' ))
+          while [ "$(date +%s)" -lt "${deadline}" ]; do
+            used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1)
+            case "${used}" in
+              ""|*[!0-9]*) ;;
+              *) if [ "${used}" -gt "${peak}" ]; then peak="${used}"; printf "%s" "${peak}" > '"${peak_file}"'; fi ;;
+            esac
+            sleep '"${SAMPLE_INTERVAL}"'
+          done' >/dev/null 2>&1 &
+        echo $! > "${pid_file}"
+        echo "sampling GPU memory every ${SAMPLE_INTERVAL}s (pid $(cat "${pid_file}"), self-timeout ${SAMPLER_MAX_SECONDS}s)"

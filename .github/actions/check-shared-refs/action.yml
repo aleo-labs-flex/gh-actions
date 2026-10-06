@@ -1,0 +1,60 @@
+# Fails while any gh-actions ref in the caller's workflows is not a release
+# tag. A SHA is refused too: the AWS role trusts start-runner.yml only at a `v*`
+# tag, so a SHA pin would pass here and fail at STS with "Not authorized to
+# perform sts:AssumeRoleWithWebIdentity", which names neither the ref nor the
+# claim. A branch fails at STS the same way, and GitHub deletes a head branch
+# on merge by default, so one left behind later breaks the caller's CI with
+# `unable to resolve action` -- and while it is live, anyone who can push that
+# branch runs code holding the caller's OIDC token.
+#
+# Also fails on any ref to aws-dev-infra or aws-cuda-dev, where this code lived
+# before. The trust policy stops admitting those paths once every caller has
+# moved, so a `uses:` missed by the sweep would otherwise keep passing here and
+# fail only at that point, in CI that nobody connects to the move.
+#
+# Runs in the caller's checkout: the files it reads are theirs. Matched from
+# `uses:` on, not the bare path, so a comment naming the path is not a ref.
+name: Check shared refs
+description: Every aleo-labs-flex/gh-actions reference in .github/workflows must be pinned to a @vN release tag.
+
+runs:
+  using: composite
+  steps:
+    - name: gh-actions refs must be a release tag
+      shell: bash
+      run: |
+        set -euo pipefail
+        # The trailing trim is for a quoted or flow-style ref -- `uses: "…@v1"`,
+        # `- { uses: …@v1, if: … }` -- whose closing quote or comma would
+        # otherwise fail a correctly pinned ref.
+        refs() {
+          { grep -rhoE 'uses:[[:space:]]*["'"'"']?'"$1"'/[^[:space:]]+' .github/workflows/ || true; } \
+            | sed -E 's/["'"'"',}]+$//'
+        }
+        # Owner-anchored: "gh-actions" is a common repo name, and another
+        # org's would otherwise be held to this repo's pinning rule. Losing the
+        # owner wildcard is safe because matching nothing is an error below.
+        all=$(refs 'aleo-labs-flex/gh-actions')
+        old=$(refs '[A-Za-z0-9._-]+/(aws-dev-infra|aws-cuda-dev)')
+        if [ -n "${old}" ]; then
+          echo "::error::these moved to aleo-labs-flex/gh-actions; repoint them:" >&2
+          printf '%s\n' "${old}" | sed 's/^/  /' >&2
+          exit 1
+        fi
+        # Matching nothing is this check's own most likely failure, and it has
+        # happened once: an org-keyed pattern went quiet when the repos moved.
+        # A caller reaches this step through a `uses:` naming this repository,
+        # so zero matches means the pattern is wrong, not that the caller is
+        # clean. Say so instead of printing the all-clear.
+        if [ -z "${all}" ]; then
+          echo "::error::no gh-actions refs found in .github/workflows; this check matched nothing, which is not the same as everything being pinned" >&2
+          exit 1
+        fi
+        bad=$(printf '%s\n' "${all}" \
+              | grep -vE '@v[0-9]+(\.[0-9]+)*$' || true)
+        if [ -n "${bad}" ]; then
+          echo "::error::non-release ref(s) to gh-actions; pin @vN before merging:" >&2
+          printf '%s\n' "${bad}" | sed 's/^/  /' >&2
+          exit 1
+        fi
+        echo "all gh-actions refs are pinned"
