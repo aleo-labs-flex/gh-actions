@@ -217,7 +217,7 @@ jobs:
       (github.event.pull_request == null ||
        github.event.pull_request.head.repo.full_name == github.repository)
     steps:
-      - uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         id: runner-app
         if: env.HAS_RUNNER_APP_KEY == 'true' && inputs.runner-app-id != ''
         # Best effort, always: a missing id, a key that does not match, or an app
