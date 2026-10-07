@@ -224,7 +224,7 @@ jobs:
         # not installed here must fall back to busy=0, not redden a run.
         continue-on-error: true
         with:
-          app-id: ${{ inputs.runner-app-id }}
+          client-id: ${{ inputs.runner-app-id }}
           private-key: ${{ secrets.runner_app_key }}
           owner: ${{ github.repository_owner }}
           permission-organization-self-hosted-runners: read
