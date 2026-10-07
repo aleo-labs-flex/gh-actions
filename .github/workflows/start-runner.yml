@@ -132,15 +132,6 @@ on:
         required: false
         default: 3
         type: number
-      runner-org:
-        description: >-
-          Organisation whose runners are counted. Defaults to the caller's own,
-          which is right while the fleet and its callers share one org; a caller
-          elsewhere must name the org the runners are registered to, or the
-          count is of a fleet that is not theirs.
-        required: false
-        default: ''
-        type: string
       runner-app-id:
         description: >-
           App id matching runner_app_key. Both or neither -- a key without an id
@@ -239,7 +230,7 @@ jobs:
           GH_TOKEN: ${{ steps.runner-app.outputs.token }}
           LABEL: ${{ inputs.label }}
           FLEET: ${{ inputs.fleet }}
-          ORG: ${{ inputs.runner-org != '' && inputs.runner-org || github.repository_owner }}
+          ORG: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
           # Captured before it is parsed: a 403 or a rate limit parsed as JSON
