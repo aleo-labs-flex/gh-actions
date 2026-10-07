@@ -130,7 +130,12 @@ neither the ref nor the claim. Every caller should run `check-shared-refs`: it
 fails on a ref that is not `@vN`, and on any ref to `aws-dev-infra`, where this
 code used to live.
 
-A tag ruleset on `v*` restricts creating, **updating** and deleting tags to its
+That makes the org setting "Require actions to be pinned to a full-length commit
+SHA" incompatible with this repository: turned on, it rejects every caller's
+`@v1`, and a SHA pin is refused by the role. Change the trust policy in
+aws-dev-infra's `setup-oidc-role.sh` before turning it on.
+
+A ruleset on all tags restricts creating, **updating** and deleting them to its
 bypass list. Moving `v1` is an update, and it changes what runs with the
 fleet's AWS credentials in every caller at once, so move it deliberately.
 
