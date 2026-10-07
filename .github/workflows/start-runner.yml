@@ -230,9 +230,6 @@ jobs:
           GH_TOKEN: ${{ steps.runner-app.outputs.token }}
           LABEL: ${{ inputs.label }}
           FLEET: ${{ inputs.fleet }}
-          # The org the token above was minted for. There was a runner-org input
-          # to count another org's fleet, but the token was always minted for
-          # this one, so naming another org only ever got a 403 and busy=0.
           ORG: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
