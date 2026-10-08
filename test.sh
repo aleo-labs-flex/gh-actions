@@ -410,7 +410,7 @@ cat > "$sc_tmp/bin/aws" <<'AWSEOF'
 case "$1 $2" in
   # LADDER is the CapacityLadder tag of every box the inventory does not give
   # one, so a test names the ladder once rather than per box.
-  "ec2 describe-instances") awk -v l="${LADDER:-}" 'BEGIN { FS = OFS = "\t" } NF == 5 { $6 = l } 1' "$INV" ;;
+  "ec2 describe-instances") printf '%s\n' "$*" > "${CNT}.describe"; awk -v l="${LADDER:-}" 'BEGIN { FS = OFS = "\t" } NF == 5 { $6 = l } 1' "$INV" ;;
   "ec2 start-instances")
     id=""; prev=""
     for a in "$@"; do [[ "$prev" == "--instance-ids" ]] && id="$a"; prev="$a"; done
@@ -780,6 +780,15 @@ ck "an empty preferred tag does not swallow the ladder" \
       WANT=1 FLEET=cpu-runner LABEL=cpu FAIL_SEQ=CAP,OK fleet_start | tr '|' '\n' | head -n 1)" \
    "started cpu-runner as c6a.8xlarge"
 
+# The stub prints the columns whatever the query asks for, so the query itself
+# is pinned: the ladder is read from the sixth column, and a box with the Name
+# but not the label is not in the fleet.
+box cpu-runner c6i.8xlarge > "$sc_tmp/inv"; WANT=1 FLEET=cpu-runner LABEL=cpu fleet_start >/dev/null
+ck "the inventory asks for the ladder after the preferred shape" \
+   "$(grep -c "Tags\[?Key=='PreferredInstanceType'\]|\[0\].Value,Tags\[?Key=='CapacityLadder'\]|\[0\].Value\]" "$sc_tmp/cnt.describe")" "1"
+ck "and only for boxes carrying the label" \
+   "$(grep -c -- 'Name=tag:RunnerLabel,Values=cpu ' "$sc_tmp/cnt.describe")" "1"
+
 echo "== start-runner: the fleet is found by its label tag =="
 ff_tmp="$(mktemp -d)"; mkdir -p "$ff_tmp/bin"
 python3 -c "
@@ -808,6 +817,8 @@ ck "the fleet is the tagged boxes, in name order" \
    "$(NAMES='cpu-runner10\tcpu-runner2\ncpu-runner\n' find_fleet)" "cpu-runner cpu-runner2 cpu-runner10|0"
 ck "found by the label it was called with" \
    "$(grep -c -- 'Name=tag:RunnerLabel,Values=cpu ' "$ff_tmp/args")" "1"
+ck "and named by the Name tag" \
+   "$(grep -c -- "--query Reservations\[\].Instances\[\].Tags\[?Key=='Name'\].Value" "$ff_tmp/args")" "1"
 ck "a label no box carries is an error, not an empty fleet" \
    "$(NAMES='' find_fleet | cut -d'|' -f2)" "1"
 ck "and says which tag it looked for" \

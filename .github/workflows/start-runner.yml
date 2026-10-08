@@ -46,10 +46,9 @@
 #
 # WHICH BOXES. The fleet is every box whose RunnerLabel tag is the label, in name
 # order, and each box steps down its own CapacityLadder tag. aws-dev-infra's
-# provision.sh writes both from the box's config, so a box joins CI by being
-# provisioned and no caller lists the boxes. They used to: each caller carried
-# its own `fleet` and `ladder`, and a new box was started by none of them until
-# every copy was edited.
+# provision.sh writes both from the box's config, so no caller lists the boxes.
+# StartInstances is still scoped by Name in IAM: a new box is started once
+# setup-oidc-role.sh has been re-run to admit it.
 #
 # HOW MANY BOXES. Two terms, and the reason for each:
 #
@@ -104,12 +103,11 @@ on:
       label:
         description: >-
           The runner label whose queued jobs are counted, and the RunnerLabel tag
-          the fleet is found by.
+          the fleet is found by -- a box's FIRST label, so `gpu` or `cpu`, never
+          a secondary one such as sm_89.
         required: false
-        # Must be a label the runners actually carry: counting a label nobody
-        # offers counts zero forever, and zero is indistinguishable from an idle
-        # repository. The floor of 1 keeps that from hanging a run, but the
-        # fleet would never grow past one box however deep the queue got.
+        # A label no box is tagged with fails the run at Find the fleet rather
+        # than counting zero forever.
         default: gpu
         type: string
       jobs-per-box:
@@ -411,7 +409,6 @@ jobs:
           set -euo pipefail
           read -ra boxes <<<"${FLEET}"
           size=${#boxes[@]}
-          [ "${size}" -gt 0 ] || { echo "::error::fleet is empty" >&2; exit 1; }
           queued="${QUEUED:-0}"; busy="${BUSY:-0}"
           per="${JOBS_PER_BOX}"
           # A zero would divide by zero and a negative would shrink the fleet
@@ -491,7 +488,8 @@ jobs:
           # Sets CHAIN: the shapes a box may be started as, in the order to try
           # them.
           # $1 = instance id, $2 = current type, $3 = the PreferredInstanceType
-          # tag, $4 = the CapacityLadder tag ("None" when a box lacks either).
+          # tag, $4 = the CapacityLadder tag ("None" or empty when a box lacks
+          # either).
           chain_of() {
             local RUNNER_ID="$1" CURRENT="$2" PREFERRED="$3" LADDER="$4" seen=0 s
             CHAIN=""
@@ -531,9 +529,8 @@ jobs:
               [ "${s}" = "${PREFERRED}" ] && seen=1
               [ "${seen}" = 1 ] && CHAIN="${CHAIN}${CHAIN:+ }${s}"
             done
-            # A preferred shape that is not on the ladder at all -- an override,
-            # a future type, or a CPU box started without its own ladder -- is
-            # tried on its own. Walking a ladder it is not on would retype it
+            # A box with no ladder, or whose preferred shape is not on it -- an
+            # override or a future type -- is tried on its own. Walking a ladder it is not on would retype it
             # into shapes it never asked for: a c6i onto a g6.
             if [ -z "${LADDER}" ]; then
               warn "${RUNNER_ID} has no CapacityLadder tag; no capacity fallback for it"
@@ -567,6 +564,7 @@ jobs:
           read -ra boxes <<<"${FLEET}"
           if ! inv=$(aws ec2 describe-instances \
               --filters "Name=tag:Name,Values=$(IFS=,; echo "${boxes[*]}")" \
+                        "Name=tag:RunnerLabel,Values=${LABEL}" \
                         "Name=instance-state-name,Values=pending,running,stopping,stopped" \
               --query "Reservations[].Instances[].[Tags[?Key=='Name']|[0].Value,InstanceId,InstanceType,State.Name,Tags[?Key=='PreferredInstanceType']|[0].Value,Tags[?Key=='CapacityLadder']|[0].Value]" \
               --output text); then
@@ -601,7 +599,7 @@ jobs:
               # from each starting a box for the same queue.
               pending|running) online=$((online + 1)); echo "${tag} (${id}) is ${state} as ${type}" ;;
               *)
-                chain_of "${id}" "${type}" "${preferred:-None}" "${ladder:-None}"
+                chain_of "${id}" "${type}" "${preferred:-None}" "${ladder}"
                 echo "${tag} (${id}): ${type}, will try ${CHAIN}"
                 tags+=("${tag}"); ids+=("${id}"); cur+=("${type}"); states+=("${state}")
                 chains+=("${CHAIN}"); fate+=(pending); last+=("")
