@@ -239,8 +239,8 @@ ck "nothing gates the AWS steps" \
 import yaml
 d = yaml.safe_load(open('$REPO/.github/workflows/start-runner.yml'))
 st = d['jobs']['start']['steps']
-aws = [x for x in st if 'configure-aws-credentials' in str(x.get('uses', '')) or x.get('name') == 'Start what the fleet is short']
-print(len(aws), sum(1 for x in aws if 'if' in x))")" "2 0"
+aws = [x for x in st if 'configure-aws-credentials' in str(x.get('uses', '')) or x.get('name') in ('Find the fleet', 'Start what the fleet is short')]
+print(len(aws), sum(1 for x in aws if 'if' in x))")" "3 0"
 # `secrets` is not a context a step-level `if` can read: the expression fails to
 # compile and takes down every caller.
 ck "the secret is not read in a step if" \
@@ -408,7 +408,9 @@ cat > "$sc_tmp/bin/aws" <<'AWSEOF'
 #!/usr/bin/env bash
 # Mock aws CLI. State lives in files, since each invocation is a new process.
 case "$1 $2" in
-  "ec2 describe-instances") cat "$INV" ;;
+  # LADDER is the CapacityLadder tag of every box the inventory does not give
+  # one, so a test names the ladder once rather than per box.
+  "ec2 describe-instances") awk -v l="${LADDER:-}" 'BEGIN { FS = OFS = "\t" } NF == 5 { $6 = l } 1' "$INV" ;;
   "ec2 start-instances")
     id=""; prev=""
     for a in "$@"; do [[ "$prev" == "--instance-ids" ]] && id="$a"; prev="$a"; done
@@ -429,7 +431,8 @@ AWSEOF
 chmod +x "$sc_tmp/bin/aws"
 
 # One line per box, exactly as `describe-instances --output text` prints the
-# query: Name tag, id, type, state, PreferredInstanceType. "None" is what it
+# query: Name tag, id, type, state, PreferredInstanceType, and the stub adds
+# CapacityLadder. "None" is what it
 # really prints for a tag that is not there -- a box provisioned before
 # aws-dev-infra wrote that tag, which the chain still has to handle.
 box() { printf '%s\ti-%s\t%s\t%s\t%s\n' "$1" "$1" "$2" "${3:-stopped}" "${4:-None}"; }
@@ -760,6 +763,57 @@ ck "a small box never grows past its tag" \
 ck "untagged box: down its ladder from where it is" \
    "$(start_chain g6e.xlarge CAP,CAP | tr '|' '\n' | tail -n 2 | head -n 1)" \
    "::warning::could not start i-gpu-runner as any of its shapes (tried: g6e.xlarge)"
+
+# The ladder is each box's own CapacityLadder tag ("None" when it has none), so one fleet can hold boxes
+# with different ladders and none is walked down another's.
+ck "each box walks its own ladder tag" \
+   "$(printf 'cpu-runner\ti-cpu-runner\tc6i.8xlarge\tstopped\tc6i.8xlarge\tc6i.8xlarge c6a.8xlarge\n' > "$sc_tmp/inv"
+      WANT=1 FLEET=cpu-runner LABEL=cpu FAIL_SEQ=CAP,OK fleet_start | tr '|' '\n' | head -n 1)" \
+   "started cpu-runner as c6a.8xlarge"
+ck "a box with no ladder tag is tried as itself, and says so" \
+   "$(box cpu-runner c6i.8xlarge > "$sc_tmp/inv"; WANT=1 FLEET=cpu-runner LABEL=cpu LADDER=None FAIL_SEQ=CAP fleet_start | tr '|' '\n' | head -n 2 | tr '\n' '|')" \
+   "::warning::i-cpu-runner has no CapacityLadder tag; no capacity fallback for it|::warning::could not start i-cpu-runner as any of its shapes (tried: c6i.8xlarge)|"
+# Tab is IFS whitespace, so splitting on it collapses an empty field: an empty
+# PreferredInstanceType tag would hand the ladder to `preferred`.
+ck "an empty preferred tag does not swallow the ladder" \
+   "$(printf 'cpu-runner\ti-cpu-runner\tc6i.8xlarge\tstopped\t\tc6i.8xlarge c6a.8xlarge\n' > "$sc_tmp/inv"
+      WANT=1 FLEET=cpu-runner LABEL=cpu FAIL_SEQ=CAP,OK fleet_start | tr '|' '\n' | head -n 1)" \
+   "started cpu-runner as c6a.8xlarge"
+
+echo "== start-runner: the fleet is found by its label tag =="
+ff_tmp="$(mktemp -d)"; mkdir -p "$ff_tmp/bin"
+python3 -c "
+import yaml
+d = yaml.safe_load(open('$SCR'))
+steps = {s.get('name'): s for s in d['jobs']['start']['steps'] if s.get('name')}
+open('$ff_tmp/find.sh', 'w').write(steps['Find the fleet']['run'])
+"
+cat > "$ff_tmp/bin/aws" <<'AWSEOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "$ARGS"
+[ -z "${AWS_FAIL:-}" ] || exit 1
+printf '%b' "${NAMES:-}"
+AWSEOF
+chmod +x "$ff_tmp/bin/aws"
+find_fleet() { # NAMES as --output text prints them -> the fleet output and the step's exit code
+  : > "$ff_tmp/out"
+  local rc=0
+  PATH="$ff_tmp/bin:$PATH" ARGS="$ff_tmp/args" LABEL=cpu GITHUB_OUTPUT="$ff_tmp/out" \
+    bash "$ff_tmp/find.sh" >/dev/null 2>&1 || rc=$?
+  printf '%s|%s' "$(sed -n 's/^fleet=//p' "$ff_tmp/out")" "$rc"
+}
+# In name order whatever order EC2 answers in, so concurrent runs wake the same
+# box first, and version order so a tenth box is not second.
+ck "the fleet is the tagged boxes, in name order" \
+   "$(NAMES='cpu-runner10\tcpu-runner2\ncpu-runner\n' find_fleet)" "cpu-runner cpu-runner2 cpu-runner10|0"
+ck "found by the label it was called with" \
+   "$(grep -c -- 'Name=tag:RunnerLabel,Values=cpu ' "$ff_tmp/args")" "1"
+ck "a label no box carries is an error, not an empty fleet" \
+   "$(NAMES='' find_fleet | cut -d'|' -f2)" "1"
+ck "and says which tag it looked for" \
+   "$(PATH="$ff_tmp/bin:$PATH" ARGS="$ff_tmp/args" NAMES='' LABEL=cpu GITHUB_OUTPUT=/dev/null bash "$ff_tmp/find.sh" 2>&1 | grep -c '^::error::no box is tagged RunnerLabel=cpu')" "1"
+ck "a describe that fails is an error" \
+   "$(PATH="$ff_tmp/bin:$PATH" ARGS="$ff_tmp/args" AWS_FAIL=1 LABEL=cpu GITHUB_OUTPUT=/dev/null bash "$ff_tmp/find.sh" 2>&1 | grep -c '^::error::could not describe the cpu fleet')" "1"
 
 echo "== start-runner: the queue this repository can see =="
 # Only jobs still waiting for a runner with the label count: a queued job on
