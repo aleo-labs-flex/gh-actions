@@ -20,7 +20,7 @@
 #
 #   jobs:
 #     start-runners:
-#       uses: aleo-labs-flex/gh-actions/.github/workflows/start-runner.yml@v1
+#       uses: aleo-labs-flex/gh-actions/.github/workflows/start-runner.yml@v2
 #       permissions: { id-token: write, contents: read, actions: read }
 #       with:
 #         role-to-assume: ${{ vars.RUNNER_ROLE_ARN }}
@@ -41,8 +41,14 @@
 #       ...
 #
 # The same workflow starts the CPU boxes for jobs that never needed a GPU: pass
-# a `fleet` naming the CPU boxes, `label: cpu`, and a `ladder` of CPU shapes.
-# See "A CPU box for the jobs that never needed a GPU" in the aws-dev-infra README.
+# `label: cpu`. See "A CPU box for the jobs that never needed a GPU" in the
+# aws-dev-infra README.
+#
+# WHICH BOXES. The fleet is every box whose RunnerLabel tag is the label, in name
+# order, and each box steps down its own CapacityLadder tag. aws-dev-infra's
+# provision.sh writes both from the box's config, so no caller lists the boxes.
+# StartInstances is still scoped by Name in IAM: a new box is started once
+# setup-oidc-role.sh has been re-run to admit it.
 #
 # HOW MANY BOXES. Two terms, and the reason for each:
 #
@@ -85,8 +91,8 @@ on:
       role-to-assume:
         description: >-
           IAM role ARN for the caller to assume by OIDC. Must permit
-          ec2:StartInstances and ec2:ModifyInstanceAttribute on every instance
-          in `fleet`, plus ec2:DescribeInstances. Normally vars.RUNNER_ROLE_ARN.
+          ec2:StartInstances and ec2:ModifyInstanceAttribute on every box in the
+          fleet, plus ec2:DescribeInstances. Normally vars.RUNNER_ROLE_ARN.
         required: true
         type: string
       aws-region:
@@ -94,21 +100,14 @@ on:
         required: false
         default: us-west-2
         type: string
-      fleet:
-        description: >-
-          Name tags of the boxes this label is served by, in the order they
-          should be started. IAM scopes StartInstances to these tags. Adding a
-          box to the fleet is this one string, in one place.
-        required: false
-        default: gpu-runner gpu-runner2 gpu-runner3 gpu-runner4
-        type: string
       label:
-        description: The runner label whose queued jobs are counted.
+        description: >-
+          The runner label whose queued jobs are counted, and the RunnerLabel tag
+          the fleet is found by -- a box's FIRST label, so `gpu` or `cpu`, never
+          a secondary one such as sm_89.
         required: false
-        # Must be a label the runners actually carry: counting a label nobody
-        # offers counts zero forever, and zero is indistinguishable from an idle
-        # repository. The floor of 1 keeps that from hanging a run, but the
-        # fleet would never grow past one box however deep the queue got.
+        # A label no box is tagged with fails the run at Find the fleet rather
+        # than counting zero forever.
         default: gpu
         type: string
       jobs-per-box:
@@ -138,15 +137,6 @@ on:
           mints nothing, and the census silently falls back to busy=0.
         required: false
         default: ''
-        type: string
-      ladder:
-        description: >-
-          Instance types a box may be retyped to when its AZ has no capacity,
-          widest first; the chain starts at the box's PreferredInstanceType tag
-          and only steps down. The default is the Ada ladder; a CPU box passes
-          its own, e.g. "c6i.8xlarge c6a.8xlarge m6i.8xlarge".
-        required: false
-        default: g6.4xlarge g6.2xlarge g6.xlarge g6e.xlarge
         type: string
       capacity-retry-seconds:
         description: >-
@@ -208,6 +198,33 @@ jobs:
       (github.event.pull_request == null ||
        github.event.pull_request.head.repo.full_name == github.repository)
     steps:
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Find the fleet
+        id: fleet
+        env:
+          LABEL: ${{ inputs.label }}
+        run: |
+          set -euo pipefail
+          # Name order, so concurrent runs wake the same box first. A tag on a
+          # box outside the fleet cannot widen what this starts: StartInstances
+          # is scoped by Name in IAM.
+          names=$(aws ec2 describe-instances \
+              --filters "Name=tag:RunnerLabel,Values=${LABEL}" \
+                        "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+              --query "Reservations[].Instances[].Tags[?Key=='Name'].Value" \
+              --output text) || { echo "::error::could not describe the ${LABEL} fleet" >&2; exit 1; }
+          fleet=$(tr -s '[:space:]' '\n' <<<"${names}" | sed '/^$/d' | sort -uV | paste -sd' ' -)
+          if [ -z "${fleet}" ]; then
+            echo "::error::no box is tagged RunnerLabel=${LABEL}; aws-dev-infra's provision.sh writes it" >&2
+            exit 1
+          fi
+          echo "${LABEL} fleet: ${fleet}"
+          echo "fleet=${fleet}" >> "${GITHUB_OUTPUT}"
+
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         id: runner-app
         if: env.HAS_RUNNER_APP_KEY == 'true' && inputs.runner-app-id != ''
@@ -229,7 +246,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.runner-app.outputs.token }}
           LABEL: ${{ inputs.label }}
-          FLEET: ${{ inputs.fleet }}
+          FLEET: ${{ steps.fleet.outputs.fleet }}
           ORG: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
@@ -380,7 +397,7 @@ jobs:
       - name: Size the fleet to the work
         id: plan
         env:
-          FLEET: ${{ inputs.fleet }}
+          FLEET: ${{ steps.fleet.outputs.fleet }}
           LABEL: ${{ inputs.label }}
           JOBS_PER_BOX: ${{ inputs.jobs-per-box }}
           # Unset when the step failed or never ran; both mean "could not see",
@@ -392,7 +409,6 @@ jobs:
           set -euo pipefail
           read -ra boxes <<<"${FLEET}"
           size=${#boxes[@]}
-          [ "${size}" -gt 0 ] || { echo "::error::fleet is empty" >&2; exit 1; }
           queued="${QUEUED:-0}"; busy="${BUSY:-0}"
           per="${JOBS_PER_BOX}"
           # A zero would divide by zero and a negative would shrink the fleet
@@ -419,17 +435,11 @@ jobs:
           echo "${LABEL}: ${queued} queued here + ${busy} boxes busy elsewhere, ${per} per box -> want ${want} of ${size}"
           echo "want=${want}" >> "${GITHUB_OUTPUT}"
 
-      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
-        with:
-          role-to-assume: ${{ inputs.role-to-assume }}
-          aws-region: ${{ inputs.aws-region }}
-
       - name: Start what the fleet is short
         env:
-          FLEET: ${{ inputs.fleet }}
+          FLEET: ${{ steps.fleet.outputs.fleet }}
           LABEL: ${{ inputs.label }}
           WANT: ${{ steps.plan.outputs.want }}
-          LADDER: ${{ inputs.ladder }}
           CAPACITY_RETRY_SECONDS: ${{ inputs.capacity-retry-seconds }}
         run: |
           set -euo pipefail
@@ -478,10 +488,12 @@ jobs:
           # Sets CHAIN: the shapes a box may be started as, in the order to try
           # them.
           # $1 = instance id, $2 = current type, $3 = the PreferredInstanceType
-          # tag ("None" when the box predates it).
+          # tag, $4 = the CapacityLadder tag ("None" or empty when a box lacks
+          # either).
           chain_of() {
-            local RUNNER_ID="$1" CURRENT="$2" PREFERRED="$3" seen=0 s
+            local RUNNER_ID="$1" CURRENT="$2" PREFERRED="$3" LADDER="$4" seen=0 s
             CHAIN=""
+            [ "${LADDER}" != "None" ] || LADDER=""
 
             # --output text prints a literal "None" for a tag that is not there
             # -- a box provisioned before aws-dev-infra started writing it, or one
@@ -517,11 +529,13 @@ jobs:
               [ "${s}" = "${PREFERRED}" ] && seen=1
               [ "${seen}" = 1 ] && CHAIN="${CHAIN}${CHAIN:+ }${s}"
             done
-            # A preferred shape that is not on the ladder at all -- an override,
-            # a future type, or a CPU box started without its own ladder -- is
-            # tried on its own. Walking a ladder it is not on would retype it
+            # A box with no ladder, or whose preferred shape is not on it -- an
+            # override or a future type -- is tried on its own. Walking a ladder it is not on would retype it
             # into shapes it never asked for: a c6i onto a g6.
-            if [ -z "${CHAIN}" ]; then
+            if [ -z "${LADDER}" ]; then
+              warn "${RUNNER_ID} has no CapacityLadder tag; no capacity fallback for it"
+              CHAIN="${PREFERRED}"
+            elif [ -z "${CHAIN}" ]; then
               warn "${PREFERRED} is not on the ladder (${LADDER}); no capacity fallback for this box"
               CHAIN="${PREFERRED}"
             fi
@@ -550,8 +564,9 @@ jobs:
           read -ra boxes <<<"${FLEET}"
           if ! inv=$(aws ec2 describe-instances \
               --filters "Name=tag:Name,Values=$(IFS=,; echo "${boxes[*]}")" \
+                        "Name=tag:RunnerLabel,Values=${LABEL}" \
                         "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-              --query "Reservations[].Instances[].[Tags[?Key=='Name']|[0].Value,InstanceId,InstanceType,State.Name,Tags[?Key=='PreferredInstanceType']|[0].Value]" \
+              --query "Reservations[].Instances[].[Tags[?Key=='Name']|[0].Value,InstanceId,InstanceType,State.Name,Tags[?Key=='PreferredInstanceType']|[0].Value,Tags[?Key=='CapacityLadder']|[0].Value]" \
               --output text); then
             echo "::error::could not describe the ${LABEL} fleet (${FLEET})" >&2
             exit 1
@@ -571,19 +586,20 @@ jobs:
               *) warn "expected one instance tagged ${tag}, found ${n}; leaving it alone"
                  continue ;;
             esac
-            # Tab-delimited and read back with IFS, not split on spaces: a
-            # PreferredInstanceType tag whose value is empty makes the last
-            # field empty, and `set -- ${c}` then leaves $4 unbound -- which
-            # under `set -u` killed the step with a bare bash error, no
-            # ::error:: annotation and no box started.
-            IFS=$'\t' read -r _ id type state preferred <<<"${match}"
+            # Tab-delimited and read back with IFS, not split on spaces: a tag
+            # whose value is empty makes its field empty, and `set -- ${c}` then
+            # left $4 unbound -- which under `set -u` killed the step with a bare
+            # bash error, no ::error:: annotation and no box started. Through
+            # \x1f rather than tab itself, which as IFS whitespace collapses an
+            # empty field and hands the ladder to `preferred`.
+            IFS=$'\x1f' read -r _ id type state preferred ladder <<<"${match//$'\t'/$'\x1f'}"
             case "${state}" in
               # StartInstances is idempotent over running and pending, but
               # counting them as already-online is what keeps concurrent runs
               # from each starting a box for the same queue.
               pending|running) online=$((online + 1)); echo "${tag} (${id}) is ${state} as ${type}" ;;
               *)
-                chain_of "${id}" "${type}" "${preferred:-None}"
+                chain_of "${id}" "${type}" "${preferred:-None}" "${ladder}"
                 echo "${tag} (${id}): ${type}, will try ${CHAIN}"
                 tags+=("${tag}"); ids+=("${id}"); cur+=("${type}"); states+=("${state}")
                 chains+=("${CHAIN}"); fate+=(pending); last+=("")

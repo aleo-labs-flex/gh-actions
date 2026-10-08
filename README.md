@@ -21,7 +21,7 @@ jobs:
   # is no second caller to keep in step with this one. actions:read is what lets
   # it count the queue; secrets: inherit carries the runner-census key.
   start-runners:
-    uses: aleo-labs-flex/gh-actions/.github/workflows/start-runner.yml@v1
+    uses: aleo-labs-flex/gh-actions/.github/workflows/start-runner.yml@v2
     permissions: { id-token: write, contents: read, actions: read }
     secrets: inherit
     with:
@@ -40,11 +40,11 @@ jobs:
     needs: start-runners
     runs-on: [self-hosted, linux, x64, gpu, sm_89]
     steps:
-      - uses: aleo-labs-flex/gh-actions/.github/actions/gpu-runner-preflight@v1
+      - uses: aleo-labs-flex/gh-actions/.github/actions/gpu-runner-preflight@v2
       - uses: actions/checkout@v5
         with: { persist-credentials: false }
       - run: cargo test --release --features cuda      # your own command
-      - uses: aleo-labs-flex/gh-actions/.github/actions/gpu-runner-report@v1
+      - uses: aleo-labs-flex/gh-actions/.github/actions/gpu-runner-report@v2
         if: always()
 ```
 
@@ -94,21 +94,21 @@ A caller then passes both through:
 
 ```yaml
   start-cpu-runners:
-    uses: aleo-labs-flex/gh-actions/.github/workflows/start-runner.yml@v1
+    uses: aleo-labs-flex/gh-actions/.github/workflows/start-runner.yml@v2
     permissions: { id-token: write, contents: read, actions: read }
     with:
       role-to-assume: ${{ vars.RUNNER_ROLE_ARN }}
-      fleet: cpu-runner cpu-runner2 cpu-runner3 cpu-runner4
       label: cpu
-      ladder: c6i.8xlarge c6a.8xlarge m6i.8xlarge
       runner-app-id: ${{ vars.RUNNER_APP_ID }}
     secrets:
       runner_app_key: ${{ secrets.RUNNER_APP_KEY }}
 ```
 
 No thresholds in the caller: how deep a queue justifies another box is a
-property of the fleet, and it lives with the fleet. The caller says which boxes
-exist and which label they answer to.
+property of the fleet, and it lives with the fleet. So is which boxes there are:
+the caller names only the label its jobs need, and the fleet is every box whose
+`RunnerLabel` tag is that label, each stepping down its own `CapacityLadder` tag
+when its AZ is short. aws-dev-infra's `provision.sh` writes both.
 
 **The secret name has underscores on purpose.** GitHub secret names cannot contain
 hyphens, so a `runner-app-key` secret could never be supplied by `secrets: inherit`
@@ -123,7 +123,7 @@ count it could not take.
 
 ## Versioning
 
-Callers pin `@v1`. The AWS role trusts `start-runner.yml` **only at a `v*` tag**
+Callers pin a major tag, currently `@v2`. The AWS role trusts `start-runner.yml` **only at a `v*` tag**
 — not a branch, not a SHA — so a caller pinned any other way is denied at STS
 with "Not authorized to perform sts:AssumeRoleWithWebIdentity", which names
 neither the ref nor the claim. Every caller should run `check-shared-refs`: it
@@ -132,12 +132,14 @@ code used to live.
 
 That makes the org setting "Require actions to be pinned to a full-length commit
 SHA" incompatible with this repository: turned on, it rejects every caller's
-`@v1`, and a SHA pin is refused by the role. Change the trust policy in
+`@v2`, and a SHA pin is refused by the role. Change the trust policy in
 aws-dev-infra's `setup-oidc-role.sh` before turning it on.
 
 A ruleset on all tags restricts creating, **updating** and deleting them to its
-bypass list. Moving `v1` is an update, and it changes what runs with the
-fleet's AWS credentials in every caller at once, so move it deliberately.
+bypass list. Moving a major tag is an update, and it changes what runs with
+the fleet's AWS credentials in every caller at once, so move it deliberately.
+A change callers must adapt to gets a new major tag instead, as v2 did when it
+dropped the `fleet` and `ladder` inputs.
 
 **Trying a change before it is released** needs a tag too, since the role
 trusts nothing else: someone on the bypass list tags the commit `v0-<topic>`,
