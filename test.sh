@@ -457,16 +457,23 @@ ck "a stopped box is started" \
    "started gpu-runner as g6.xlarge|"
 ck "g6 exhausted -> g6e succeeds" \
    "$(start_chain g6.xlarge CAP,OK)" \
-   "started gpu-runner as g6e.xlarge|::warning::gpu-runner started as g6e.xlarge instead of its configured g6.xlarge: no capacity for it in its AZ|"
-# Four boxes, a quota for two: the rest are refused by the quota, which is said
-# plainly and costs the box, never a walk down the ladder.
+   "started gpu-runner as g6e.xlarge|::warning::gpu-runner started as g6e.xlarge instead of its configured g6.xlarge: no capacity or quota for it|"
+# Three boxes, a quota for two: the third is refused by the quota, which is said
+# plainly. Two are online, so it is not walked down the ladder.
 rm -f "$sc_tmp"/cnt.*
 box gpu-runner g6.4xlarge running g6.4xlarge > "$sc_tmp/inv"
 box gpu-runner2 g6.4xlarge running g6.4xlarge >> "$sc_tmp/inv"
 box gpu-runner3 g6.4xlarge stopped g6.4xlarge >> "$sc_tmp/inv"
 ck "a start past the quota is skipped" \
    "$(WANT=3 FLEET="gpu-runner gpu-runner2 gpu-runner3" LABEL=gpu FAIL_SEQ=QUOTA fleet_start)" \
-   "::warning::starting i-gpu-runner3 would exceed the account's vCPU quota; skipping it|::warning::wanted 3 gpu boxes, have 2; the queue will drain slower|"
+   "::warning::starting i-gpu-runner3 as g6.4xlarge would exceed the account's vCPU quota; skipping it|::warning::wanted 3 gpu boxes, have 2; the queue will drain slower|"
+# Nothing online: a smaller shape may fit the quota the configured one exceeds.
+ck "a blocked box steps down past the quota" \
+   "$(PREFERRED_TAG=g6.4xlarge start_chain g6.4xlarge QUOTA,OK)" \
+   "started gpu-runner as g6.2xlarge|::warning::gpu-runner started as g6.2xlarge instead of its configured g6.4xlarge: no capacity or quota for it|"
+ck "and names the quota when none fits" \
+   "$(PREFERRED_TAG=g6.4xlarge start_chain g6.4xlarge QUOTA,QUOTA,QUOTA,QUOTA | cut -d'|' -f1)" \
+   "::warning::starting i-gpu-runner as g6e.xlarge would exceed the account's vCPU quota; skipping it"
 # Nothing left to try: loud and specific, never a silent hang.
 ck "g6 and g6e exhausted -> named error" \
    "$(start_chain g6.xlarge CAP,CAP)" \
@@ -589,7 +596,7 @@ ck "a box nothing waits for is not retyped for capacity" \
 rm -f "$sc_tmp"/cnt.*
 ck "and the box that is waited for still walks its ladder" \
    "$(TAG=gpu-runner start_chain g6.xlarge CAP,OK)" \
-   "started gpu-runner as g6e.xlarge|::warning::gpu-runner started as g6e.xlarge instead of its configured g6.xlarge: no capacity for it in its AZ|"
+   "started gpu-runner as g6e.xlarge|::warning::gpu-runner started as g6e.xlarge instead of its configured g6.xlarge: no capacity or quota for it|"
 
 # Every AZ is asked before any box steps down. The old layout walked the first
 # box's whole ladder before asking the second box once, so on 2026-09-29 the
@@ -723,7 +730,7 @@ ck "provision hint names the role for cpu-runner3" \
 # shape is still tried first.
 ck "cpu ladder: current first, then its own shapes" \
    "$(TAG=cpu-runner LABEL=cpu LADDER="c6i.8xlarge c6a.8xlarge m6i.8xlarge" start_chain c6i.8xlarge CAP,OK)" \
-   "started cpu-runner as c6a.8xlarge|::warning::cpu-runner started as c6a.8xlarge instead of its configured c6i.8xlarge: no capacity for it in its AZ|"
+   "started cpu-runner as c6a.8xlarge|::warning::cpu-runner started as c6a.8xlarge instead of its configured c6i.8xlarge: no capacity or quota for it|"
 # Started without its own ladder, a CPU box is off the Ada one: it is tried as
 # it is and nothing else. The alternative walked the whole GPU ladder.
 ck "off-ladder box: itself only, and says so" \
@@ -746,7 +753,7 @@ ck "degraded box climbs back to its tag" \
 # is harder to find than a 2xlarge, and the job wants the most cores it can get.
 ck "steps down a size at a time" \
    "$(PREFERRED_TAG=g6.4xlarge start_chain g6.4xlarge CAP,OK)" \
-   "started gpu-runner as g6.2xlarge|::warning::gpu-runner started as g6.2xlarge instead of its configured g6.4xlarge: no capacity for it in its AZ|"
+   "started gpu-runner as g6.2xlarge|::warning::gpu-runner started as g6.2xlarge instead of its configured g6.4xlarge: no capacity or quota for it|"
 ck "exhausts the ladder in order" \
    "$(PREFERRED_TAG=g6.4xlarge start_chain g6.4xlarge CAP,CAP,CAP,CAP,CAP | tr '|' '\n' | tail -n 2 | head -n 1)" \
    "::warning::could not start i-gpu-runner as any of its shapes (tried: g6.4xlarge g6.2xlarge g6.xlarge g6e.xlarge)"

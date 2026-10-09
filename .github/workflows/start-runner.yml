@@ -468,7 +468,8 @@ jobs:
           # One StartInstances call, no waiting: the round loop below is the
           # only retry, and its sleep the only throttle.
           #   0 started, 1 no capacity, 2 still stopping (try it next round),
-          #   3 give up on this box.
+          #   3 give up on this box, 4 over the vCPU quota (a smaller shape may
+          #   fit).
           # 2 and 3 are never "this shape is full". A box caught mid-shutdown --
           # the routine state here, since the boxes stop themselves -- or
           # refused for a permission would start as no other shape either, and
@@ -480,7 +481,7 @@ jobs:
             case "${err}" in
               *InsufficientInstanceCapacity*) return 1 ;;
               *IncorrectInstanceState*) return 2 ;;
-              *VcpuLimitExceeded*) warn "starting $1 would exceed the account's vCPU quota; skipping it"; return 3 ;;
+              *VcpuLimitExceeded*) return 4 ;;
               *) warn "${err}"; return 3 ;;
             esac
           }
@@ -654,10 +655,11 @@ jobs:
                 case "${rc}" in
                   0) fate[i]=started; started=$((started + 1))
                      echo "started ${tags[i]} as ${t}"
-                     [ "${r}" -eq 0 ] || warn "${tags[i]} started as ${t} instead of its configured ${chain[0]}: no capacity for it in its AZ"
+                     [ "${r}" -eq 0 ] || warn "${tags[i]} started as ${t} instead of its configured ${chain[0]}: no capacity or quota for it"
                      ;;
                   1) echo "${tags[i]}: no ${t} capacity in its AZ" ;;
                   2) echo "${tags[i]} is mid-stop; trying it again next round"; stopping=1 ;;
+                  4) echo "${tags[i]}: ${t} would exceed the account's vCPU quota" ;;
                   3) fate[i]=dropped ;;
                 esac
               done
@@ -685,6 +687,8 @@ jobs:
               read -ra c <<<"${chains[i]}"
               if [ "${last[i]}" = 2 ]; then
                 warn "${ids[i]} is still stopping; leaving it for the next run rather than retyping it"
+              elif [ "${last[i]}" = 4 ]; then
+                warn "starting ${ids[i]} as ${cur[i]} would exceed the account's vCPU quota; skipping it"
               elif [ $((online + started)) -eq 0 ]; then
                 warn "could not start ${ids[i]} as any of its shapes (tried: ${chains[i]})"
               elif [ "${cur[i]}" = "${c[0]}" ]; then
